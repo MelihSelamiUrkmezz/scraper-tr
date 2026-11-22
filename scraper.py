@@ -20,7 +20,7 @@ import sys
 import time
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -693,9 +693,10 @@ def collect_links(list_url, pages, fetch, delay):
         return links
 
     page_param = {"trendyol": "pi", "hepsiburada": "sayfa", "mavi": "page"}.get(site, "page")
+    max_pages = pages if pages > 0 else 100000  # 0 = ürün kalmayana dek
     links = []
     seen = set()
-    for n in range(1, pages + 1):
+    for n in range(1, max_pages + 1):
         page_url = list_url if n == 1 and site not in ("trendyol",) else with_query_param(list_url, page_param, n)
         try:
             html = fetch(page_url)
@@ -711,6 +712,58 @@ def collect_links(list_url, pages, fetch, delay):
         links += new
         time.sleep(delay)
     return links
+
+
+KIDS_CATEGORY_RX = r"/(cocuk|bebek)(/|$)"
+KIDS_NAME_RX = r"çocuk|cocuk|bebek|\bkız\b|\bkiz\b|\berkek çocuk"
+
+
+def discover_categories(start_url, fetch, include="", exclude=""):
+    """Sitenin menüsünden yaprak kategori sayfalarını bulur (şimdilik Mavi: /<yol>/c/<id>).
+    Döndürür: [(kategori_url, etiket), ...]. Alt kategorisi olan üst kategoriler atlanır."""
+    start_url = normalize_list_url(start_url)
+    site = detect_site(start_url)
+    if site != "mavi":
+        raise SystemExit(f"--crawl-categories şimdilik sadece Mavi için destekleniyor (algılanan site: {site})")
+    p = urlparse(start_url)
+    origin = f"{p.scheme}://{p.netloc}"
+    soup = BeautifulSoup(fetch(start_url), "html.parser")
+    cats = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].split("?")[0].split("#")[0]
+        m = re.match(r"^(/[^/][^?#]*)/c/\d+$", href)
+        if not m or "%25" in href:  # %252B gibi çift kodlanmış kopyaları atla
+            continue
+        segs = tuple(unquote_plus(s).replace("+", " ") for s in m.group(1).strip("/").split("/"))
+        cats.setdefault(segs, origin + href)
+    leaves = [
+        (url, "/".join(segs[1:]) if len(segs) > 1 else segs[0])
+        for segs, url in cats.items()
+        if segs[0] != "tum-urunler" and not any(o != segs and o[: len(segs)] == segs for o in cats)
+    ]
+    if include:
+        rx = re.compile(include, re.I)
+        leaves = [(u, lbl) for u, lbl in leaves if rx.search(unquote_plus(urlparse(u).path))]
+    if exclude:
+        rx = re.compile(exclude, re.I)
+        leaves = [(u, lbl) for u, lbl in leaves if not rx.search(unquote_plus(urlparse(u).path))]
+    return sorted(leaves, key=lambda x: x[0])
+
+
+def collect_from_categories(start_url, pages, fetch, delay, include="", exclude=""):
+    """Her yaprak kategoriyi sayfalayıp tüm ürün linklerini toplar. Döndürür: ([url, ...], {url: kategori})."""
+    cats = discover_categories(start_url, fetch, include, exclude)
+    print(f"{len(cats)} yaprak kategori bulundu", flush=True)
+    links, url_category = [], {}
+    for i, (cat_url, label) in enumerate(cats, 1):
+        print(f"--- [{i}/{len(cats)}] {label} ({cat_url})", flush=True)
+        for u in collect_links(cat_url, pages, fetch, delay):
+            cu = canonical_product_url(u)
+            if cu not in url_category:
+                url_category[cu] = label
+                links.append(cu)
+    print(f"Toplam {len(links)} benzersiz ürün linki toplandı", flush=True)
+    return links, url_category
 
 
 CATALOG_FIELDS = [
@@ -740,7 +793,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("urls", nargs="*")
     ap.add_argument("-l", "--list-url", help="Kategori/arama sayfası linki (Trendyol, Mavi, Zara, Hepsiburada veya genel)")
-    ap.add_argument("-p", "--pages", type=int, default=20, help="Taranacak sayfa sayısı")
+    ap.add_argument("-p", "--pages", type=int, default=20, help="Taranacak sayfa sayısı; 0 = ürün bitene kadar (tüm sayfalar)")
+    ap.add_argument("--crawl-categories", metavar="URL", help="Sitenin menüsünden tüm yaprak kategorileri bulup hepsini gezer (örn. https://www.mavi.com/); kategori etiketi otomatik yazılır")
+    ap.add_argument("--cat-include", default="", help="--crawl-categories için kategori yoluna uygulanacak regex filtresi (örn. 'kadin|erkek')")
+    ap.add_argument("--cat-exclude", default="", help="--crawl-categories için hariç tutulacak kategori yolu regex'i (örn. 'cocuk|outlet')")
+    ap.add_argument("--exclude-kids", action="store_true", help="Çocuk/bebek ürünlerini hariç tut (çocuk kategorilerini gezmez, ürün adında çocuk/bebek/kız geçenleri atlar)")
+    ap.add_argument("--exclude-name", default="", help="Ürün adı bu regex ile eşleşiyorsa ürünü atla (görsel indirilmez)")
     ap.add_argument("-m", "--max-products", type=int, default=None, help="En fazla çekilecek ürün sayısı")
     ap.add_argument("--max-images", type=int, default=3, help="Ürün başına en fazla kaydedilecek (kalite filtresini geçen) görsel sayısı; 0 = sınırsız (varsayılan: 3)")
     ap.add_argument("--max-side", type=int, default=768, help="Görselin uzun kenarı bu değeri aşarsa küçültülür (varsayılan: 768)")
@@ -760,12 +818,23 @@ def main():
     if args.file:
         with open(args.file, encoding="utf-8") as fh:
             urls += [l.strip() for l in fh if l.strip() and not l.startswith("#")]
-    fetch = fetch_browser if (args.browser or args.list_url) else fetch_requests
+    fetch = fetch_browser if (args.browser or args.list_url or args.crawl_categories) else fetch_requests
+    url_category = {}
+    cat_exclude = args.cat_exclude
+    name_exclude = args.exclude_name
+    if args.exclude_kids:
+        cat_exclude = f"{cat_exclude}|{KIDS_CATEGORY_RX}" if cat_exclude else KIDS_CATEGORY_RX
+        name_exclude = f"{name_exclude}|{KIDS_NAME_RX}" if name_exclude else KIDS_NAME_RX
+    name_exclude_rx = re.compile(name_exclude, re.I) if name_exclude else None
     try:
         if args.list_url:
             urls += collect_links(args.list_url, args.pages, fetch, args.delay)
+        if args.crawl_categories:
+            cat_links, url_category = collect_from_categories(
+                args.crawl_categories, args.pages, fetch, args.delay, args.cat_include, cat_exclude)
+            urls += cat_links
         if not urls:
-            ap.error("URL veya --list-url verin")
+            ap.error("URL, --list-url veya --crawl-categories verin")
 
         # Aynı çalıştırma içindeki tekrar eden URL'leri kanonik formda tekilleştir
         deduped_urls = []
@@ -814,6 +883,7 @@ def main():
 
         prod_count = 0
         img_count = 0
+        excluded_count = 0
         mode = "a" if append_mode else "w"
         with open(out_path, mode, newline="", encoding="utf-8-sig") as fh:
             w = csv.DictWriter(fh, fieldnames=CATALOG_FIELDS)
@@ -822,10 +892,15 @@ def main():
             for u in new_urls:
                 try:
                     product = scrape(u, fetch)
+                    if name_exclude_rx and name_exclude_rx.search(product.get("isim", "")):
+                        print(f"ATLA (ad filtresi) {product['isim'][:60]}", flush=True)
+                        excluded_count += 1
+                        continue
                     rows = download_product_images(
                         product, args.images_dir, max_images=args.max_images,
                         max_side=args.max_side, min_side=args.min_side,
-                        seen_hashes=seen_hashes, dup_threshold=args.dup_threshold, category=args.category,
+                        seen_hashes=seen_hashes, dup_threshold=args.dup_threshold,
+                        category=url_category.get(u, args.category),
                     )
                     written = 0
                     for row in rows:
@@ -846,7 +921,7 @@ def main():
                 except Exception as e:
                     print(f"HATA {u}: {e}", file=sys.stderr, flush=True)
                 time.sleep(args.delay)
-        print(f"{prod_count} yeni ürün, {img_count} görsel eklendi (atlanan: {skipped_count}) -> {out_path} ({args.images_dir}/)", flush=True)
+        print(f"{prod_count} yeni ürün, {img_count} görsel eklendi (atlanan: {skipped_count}, filtrelenen: {excluded_count}) -> {out_path} ({args.images_dir}/)", flush=True)
     finally:
         close_browser()
 

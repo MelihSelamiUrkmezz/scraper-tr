@@ -20,7 +20,12 @@ python -m playwright install chromium
 | Parametre | Kısa | Varsayılan | Açıklama |
 |---|---|---|---|
 | `--list-url URL` | `-l` | — | Kategori veya arama sayfası URL'si (Google arama linki de olabilir) |
-| `--pages N` | `-p` | `20` | Taranacak sayfa sayısı (Zara'da scroll adımı olarak kullanılır) |
+| `--pages N` | `-p` | `20` | Taranacak sayfa sayısı; `0` = ürün bitene kadar tüm sayfalar (Zara'da scroll adımı olarak kullanılır) |
+| `--crawl-categories URL` | — | — | Menüden tüm yaprak kategorileri bulup hepsini gezer (şimdilik Mavi); `kategori` otomatik yazılır |
+| `--cat-include REGEX` | — | — | `--crawl-categories` için kategori yolu filtresi (örn. `kadin\|erkek`, `ceket`) |
+| `--cat-exclude REGEX` | — | — | `--crawl-categories` için hariç tutulacak kategori yolu (örn. `cocuk\|outlet`) |
+| `--exclude-kids` | — | kapalı | Çocuk/bebek kategorilerini gezmez, adında çocuk/bebek/kız geçen ürünleri atlar |
+| `--exclude-name REGEX` | — | — | Ürün adı eşleşirse ürünü atlar (görsel indirilmez) |
 | `--max-products N` | `-m` | sınırsız | En fazla çekilecek ürün sayısı |
 | `--max-images N` | — | `3` | Ürün başına kaydedilecek (kalite filtresini geçen) görsel sayısı; `0` = sınırsız |
 | `--max-side PX` | — | `768` | Uzun kenar bu değeri aşarsa küçültülür (tüm dataset tutarlı boyutta kalır) |
@@ -54,6 +59,31 @@ python scraper.py -l "https://www.trendyol.com/sr?q=ceket" -p 20 --max-images 4
 # 4) Aynı siteyi tekrar çalıştırsanız bile mevcut ürünler atlanır, duplike oluşmaz
 python scraper.py -l "https://www.mavi.com/search/?text=ceket" -p 10 --max-images 4
 ```
+
+### Bir sitenin tüm ürünlerini çekme (Mavi)
+
+> robots.txt Mavi'de `/search/` yolunu yasaklar; tüm site taramasında arama sayfası yerine **kategori sayfalarını** kullanın.
+
+```powershell
+# A) Tek "tüm ürünler" sayfası (~24 ürün/sayfa, sayfa 300'de bile ürün var). -p 0 = bitene kadar
+python scraper.py -l "https://www.mavi.com/tum-urunler/c/0" -p 0
+
+# B) Menüdeki tüm yaprak kategoriler (kategori etiketi otomatik: "dis giyim/ceket" gibi)
+python scraper.py --crawl-categories "https://www.mavi.com/" -p 0
+
+# C) Sadece belirli kategoriler (regex)
+python scraper.py --crawl-categories "https://www.mavi.com/" --cat-include "ceket|mont|trenckot" -p 0
+
+# D) Çocuk/bebek ürünleri hariç tüm site (önerilen)
+python scraper.py --crawl-categories "https://www.mavi.com/" --exclude-kids -p 0
+```
+
+`--exclude-kids`: `/cocuk/` ve `/bebek/` kategorilerini hiç gezmez; ayrıca (outlet gibi karışık kategorilerde) adında çocuk/bebek/kız geçen ürünleri görsel indirmeden atlar. Özel filtre için `--cat-exclude "cocuk|outlet"` (kategori yolu) ve `--exclude-name REGEX` (ürün adı) kullanılabilir.
+
+- Önce tüm linkler toplanır (kategori başına birkaç dakika), sonra ürünler tek tek işlenir (~5-6 sn/ürün; 7000 ürün ≈ 10+ saat). Aynı komutu tekrar çalıştırınca kataloğa girmiş ürünler atlanır, kaldığınız yerden devam eder.
+- Önce `-m 50` ile küçük deneme yapın; sonra `-m`'siz çalıştırın.
+- Bir ürün birden fazla kategoride çıkarsa ilk bulunan kategori etiketi yazılır.
+- Disk tahmini: ürün başına 3 görsel ≈ 100-200 KB → 7000 ürün ≈ 1-1.5 GB.
 
 ### Hızlı deneme (küçük örneklem)
 
